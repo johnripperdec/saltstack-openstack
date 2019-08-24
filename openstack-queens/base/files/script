@@ -1,0 +1,166 @@
+#! /bin/bash
+# Description: databases create and grant ,service create...
+
+# See how we were called.
+case "$1" in
+  mysql_passwd)
+	mysql -e "select version();" &>/dev/null
+	if [ "$?" = "0" ]; then
+	mysql_secure_installation << EOF
+
+	y
+	{{ db_root_passwd }}
+	{{ db_root_passwd }}
+	y
+	y
+	y
+	y
+EOF
+	fi
+	;;
+  rabbitmq)
+	rabbitmqctl add_user openstack {{ db_openstack_passwd }}
+	rabbitmqctl set_permissions openstack ".*" ".*" ".*"
+	rabbitmqctl set_user_tags openstack administrator
+	rabbitmq-plugins enable rabbitmq_management
+	;;
+  keystone_prerequisites)
+	mysql -uroot -p{{ db_root_passwd }} -D keystone -e "show tables;" &> /dev/null
+	if [ "$?" = "1" ]; then
+	mysql -uroot -p{{ db_root_passwd }} -e "CREATE DATABASE keystone"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY '{{ db_keystone_passwd }}'"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%'    IDENTIFIED BY '{{ db_keystone_passwd }}'"
+	fi
+        ;;
+  keystone_ropulate)
+	su -s /bin/sh -c "keystone-manage db_sync" keystone
+  	keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+	keystone-manage credential_setup --keystone-user keystone --keystone-group keystone
+	;;
+  keystone_bootstrap)
+	keystone-manage bootstrap --bootstrap-password {{keystone_admin_pass}} \
+  	--bootstrap-admin-url http://{{controller_ip}}:35357/v3/ \
+  	--bootstrap-internal-url http://{{controller_ip}}:5000/v3/ \
+  	--bootstrap-public-url http://{{controller_ip}}:5000/v3/ \
+	--bootstrap-region-id RegionOne
+	;;
+  glance_prerequisites)
+        mysql -uroot -p{{ db_root_passwd }} -D glance -e "show tables;" &> /dev/null
+        if [ "$?" = "1" ]; then
+	mysql -uroot -p{{ db_root_passwd }} -e "CREATE DATABASE glance"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' IDENTIFIED BY '{{ db_glance_passwd }}'"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'%'    IDENTIFIED BY '{{ db_glance_passwd }}'"
+	fi
+        ;;
+  glance_create_credentials)
+	source /root/admin-openrc
+	openstack user create --domain default --password=glance glance
+	openstack role add --project service --user glance admin
+	openstack service create --name glance --description "OpenStack Image" image
+	openstack endpoint create --region RegionOne image public http://{{controller_ip}}:9292
+	openstack endpoint create --region RegionOne image internal http://{{controller_ip}}:9292
+	openstack endpoint create --region RegionOne image admin http://{{controller_ip}}:9292
+	;;
+  glance_upload_image)
+	source /root/admin-openrc
+	openstack image create "cirros" --file /tmp/cirros-0.3.4-x86_64-disk.img --disk-format qcow2 --container-format bare --public
+	openstack image list
+	;;
+
+  glance_populate_image)
+        su -s /bin/sh -c "glance-manage db_sync" glance
+        ;;
+
+  nova_api)
+        mysql -uroot -p{{ db_root_passwd }} -D nova_api -e "show tables;" &> /dev/null
+        if [ "$?" = "1" ]; then
+	mysql -uroot -p{{ db_root_passwd }} -e "CREATE DATABASE nova_api"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'localhost' IDENTIFIED BY '{{db_nova_passwd}}'"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'%'    IDENTIFIED BY '{{db_nova_passwd}}'"
+	fi
+        ;;
+  nova_cell0)
+        mysql -uroot -p{{ db_root_passwd }} -D nova_cell0 -e "show tables;" &> /dev/null
+        if [ "$?" = "1" ]; then
+	mysql -uroot -p{{ db_root_passwd }} -e "CREATE DATABASE nova_cell0"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON nova_cell0.* TO 'nova'@'localhost' IDENTIFIED BY '{{db_nova_passwd}}'"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON nova_cell0.* TO 'nova'@'%'    IDENTIFIED BY '{{db_nova_passwd}}'"
+	fi
+        ;;
+  nova)
+        mysql -uroot -p{{ db_root_passwd }} -D nova -e "show tables;" &> /dev/null
+        if [ "$?" = "1" ]; then
+	mysql -uroot -p{{ db_root_passwd }} -e "CREATE DATABASE nova"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost'    IDENTIFIED BY '{{ db_nova_passwd }}'"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'%'    IDENTIFIED BY '{{ db_nova_passwd }}';"
+	fi
+        ;;
+  nova_credentials)
+	source /root/admin-openrc
+	openstack user create --domain default --password=nova  nova
+	openstack role add --project service --user nova admin
+	openstack service create --name nova --description "OpenStack Compute" compute
+	openstack endpoint create --region RegionOne compute public http://{{controller_ip}}:8774/v2.1
+	openstack endpoint create --region RegionOne compute internal http://{{controller_ip}}:8774/v2.1
+	openstack endpoint create --region RegionOne compute admin http://{{controller_ip}}:8774/v2.1
+	openstack user create --domain default --password=placement placement
+	openstack role add --project service --user placement admin
+	openstack service create --name placement --description "Placement API" placement
+	openstack endpoint create --region RegionOne placement public http://{{controller_ip}}:8778
+	openstack endpoint create --region RegionOne placement internal http://{{controller_ip}}:8778
+	openstack endpoint create --region RegionOne placement admin http://{{controller_ip}}:8778
+	;;
+  nova_populate_db)
+	systemctl restart httpd
+	sleep 10
+	su -s /bin/sh -c "nova-manage api_db sync" nova
+	su -s /bin/sh -c "nova-manage cell_v2 map_cell0" nova
+	su -s /bin/sh -c "nova-manage cell_v2 create_cell --name=cell1 --verbose" nova
+	su -s /bin/sh -c "nova-manage db sync" nova
+	nova-manage cell_v2 list_cells
+	;;
+
+  neutron)
+        mysql -uroot -p{{ db_root_passwd }} -D neutron -e "show tables;" &> /dev/null
+        if [ "$?" = "1" ]; then
+	mysql -uroot -p{{ db_root_passwd }} -e "CREATE DATABASE neutron"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY '{{ db_neutron_passwd }}'"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%'    IDENTIFIED BY '{{ db_neutron_passwd }}'"
+	fi
+        ;;
+  neutron_credentials)
+        source /root/admin-openrc
+	openstack user create --domain default --password=neutron neutron
+	openstack role add --project service --user neutron admin
+	openstack service create --name neutron --description "OpenStack Networking" network
+	openstack endpoint create --region RegionOne network public http://{{neutron_ip}}:9696
+	openstack endpoint create --region RegionOne network internal http://{{neutron_ip}}:9696
+	openstack endpoint create --region RegionOne network admin http://{{neutron_ip}}:9696
+	;;
+  neutron_finalize)
+	ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+	su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head" neutron
+	;;
+
+  cinder)
+        mysql -uroot -p{{ db_root_passwd }} -D cinder -e "show tables;" &> /dev/null
+        if [ "$?" = "1" ]; then
+	mysql -uroot -p{{ db_root_passwd }} -e "CREATE DATABASE cinder"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'localhost' IDENTIFIED BY '{{ db_cinder_passwd }}'"
+	mysql -uroot -p{{ db_root_passwd }} -e "GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'%'    IDENTIFIED BY '{{ db_cinder_passwd }}'"
+	fi
+        ;;
+  service_entity)
+        source /root/admin-openrc
+	openstack project create --domain default --description "Service Project" service
+	openstack project create --domain default --description "Demo Project" demo
+	openstack user create --domain default --password=demo demo
+	openstack role create user
+	openstack role add --project demo --user demo user
+        ;;
+
+  *)
+        echo $"Usage: $0 {mysql_passwd | rabbitmq | keystone_prerequisites | keystone_ropulate | glance_prerequisites}"
+        exit 2
+esac
+exit $rc
